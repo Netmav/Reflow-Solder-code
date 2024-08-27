@@ -1,0 +1,1218 @@
+//Custom reflow controller with graphical user interface and semi-smart (could be better) temperature control
+//The code belongs to the following YouTube video: https://youtu.be/9xac7aseDws
+
+#include <SPI.h>
+#include <Adafruit_ST7735.h> //graphics libraries
+#include <Adafruit_GFX.h>
+#define TFT_CS     10 //Chip select pin for the TFF
+#define TFT_RST    8  //Reset pin for the TFT
+#define TFT_DC     7  //A0 pin for the TFT
+
+#define  ST7735_BLUE      0xAD55
+#define  ST7735_MAGENTA   0xECD6
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS,  TFT_DC, TFT_RST); //create tft object
+
+//Rotary encoder related
+const byte RotaryCLK = 2; //CLK pin on the rotary encoder (must be an interrupt pin)
+const byte RotaryDT = 4; //DT pin on the rotary encoder
+const byte RotarySW = 5; //SW pin on the rotary encoder (Button function)
+int selectedItem = 0; //item number for the active menu item 
+
+//Statuses of the DT and CLK pins on the encoder
+int CLKNow;
+int CLKPrevious;
+int DTNow;
+int DTPrevious;
+int RotaryButtonValue; //Pressed or not pressed rotary switch
+float RotaryButtonTime = 0; //timer for the rotary encoder's button
+
+//---Thermocouple MAX6675
+int TCRaw = 0; //raw value coming from the thermocouple
+double TCCelsius = 0; //Celsius value of the temperature reading
+const byte CS_pin = 6; //chip select pin for the thermocouple
+unsigned long temperatureTimer = 0; //Timer for measuring the temperature
+
+const byte TRIAC_pin = 9; //GPIO pin for switching the triac ON/OFF (pin 9 is also a PWM)
+const byte Fan_pin = 3; //GPIO pin for switching the fans ON/OFF (via a transistor)
+bool coolingFanEnabled = false; //status that tells the code if the fan is enabled or not
+bool heatingEnabled = false; //tells the code if the heating was enabled or not
+unsigned long TRIACTimer = 0; //Timer for switching the TRIAC
+unsigned long TRIACInterval = 1000; //update interval for switching the TRIAC - User is encouraged to experiment with this value
+double fanTimer = 0; //Time length for the ON period for of the fan - User is encouraged to experiment with this value
+double elapsedHeatingTime = 0; //Time spent in the heating phase (unit is ms)
+
+//Reflow Curve parts
+//Room temperature to soaking temperature
+volatile int preheatTemp = 90;
+volatile int preheatTime = 90; //Note: times are always as compared to zero and not the length of the process.
+
+//Soaking temperature (nearly flat curve)
+volatile int soakingTemp = 130;
+volatile int soakingTime = 180; //90+90
+
+//Soaking temperature to peak temperature (slight overshoot to peak temperature)
+volatile int reflowTemp = 165;
+volatile int reflowTime = 240; //90+90+60
+
+//Cooling temperature - Same temperature as the peak, because this part is more like keeping the solder around Tmelt for a short (~10s) time
+volatile int coolingTemp = 165;
+volatile int coolingTime = 250; //90+90+60+10
+
+double targetTemp = 0; //A variable that holds one of the above 4 target values temporarily, based on the actual part of the active heating phase
+
+//Conversion formulas for converting the physical values (T and t) into pixel values. 
+
+double tempPixelFactor = 250.0 / ((128 - 3) - 20); // y = 250 / 105 = 2.38 ~ 2°C per pixel on Y
+//-3: Axis is shifted by 3 from the bottom. -20: Axis is cut at the top by 20 px: Available area for plotting is 128-(23) = 105 px.
+double timePixelFactor = 300.0 / ((160 - 3) - 3); // x = 300 / 154 = 1.95 ~2s per pixel on X
+//-3: Axis is shifted by 3 from the left and the X-axis ends 3 pixels before the end of the screen: Available area for plotting: 160-(6) = 154
+
+//Pixel conversions - converts the physical values (t, T) into pixel values for plotting the chart
+int preheatTemp_px;
+int preheatTime_px;
+int soakingTemp_px;
+int soakingTime_px;
+int reflowTemp_px;
+int reflowTime_px;
+int coolingTemp_px;
+int coolingTime_px;
+int measuredTemp_px;
+int measuredTime_px;
+
+//---Menu related----
+volatile int itemCounter = -1; //this tells the code the active menu position
+volatile int previousItemCounter = 0; //this tells the code the previous menu position (needed for the highlighting)
+bool menuChanged = false; //it tells if the a new menu item should be drawn
+bool menuSelected = false; //it tells if the user entered a menu (selected an item)
+//Selections
+bool preheatTempSelected = false;
+bool preheatTimeSelected = false;
+bool soakingTempSelected = false;
+bool soakingTimeSelected = false;
+bool reflowTempSelected = false;
+bool reflowTimeSelected = false;
+bool coolingTempSelected = false;
+bool coolingTimeSelected = false;
+bool startStopButtonSelected = false;
+//--------------------------------------
+bool redrawCurve = true; //tells the code if the reflow curve has to be redrawn
+
+int programCounter = 0; //Helps the code decide what to do during the heating phase
+//preheat = 0
+//soaking = 1
+//reflow = 2
+//reflow_hold = 3
+//cooling = 4
+
+//Graph characteristics:
+//width: x: [3-157] -> 154px
+//height y: [10-125] -> 115px
+//temperature range: 20°C to 270°C - 250°C
+//time range: 0 s to 300 s - 300 s (5min)
+//The coordinate system of the display has inverted Y-axis. 
+//----------------------------------------------------------------------------------------------------------------------------------
+
+void setup()
+{
+  Serial.begin(9600);
+  Serial.println("Curious Scientist - Reflow controller v1.2"); //just a test message, so I know which code is on the Nano
+  SPI.begin(); //start SPI  
+ //----------------------------------------------------------------------------
+  //PINS 
+  //Rotary encoder-related
+  pinMode(RotaryCLK, INPUT); //CLK
+  pinMode(RotaryDT, INPUT); //DT
+  pinMode(RotarySW, INPUT_PULLUP); //SW
+  attachInterrupt(digitalPinToInterrupt(RotaryCLK), RotaryEncoder, CHANGE); //CLK pin is chosen as an interrupt pin
+  //Reading the current status of the encoder for preparing it for the first movement/change
+  CLKPrevious = digitalRead(RotaryCLK);
+  DTPrevious = digitalRead(RotaryDT);
+  //----------------------------------------------------------------------------
+  pinMode(CS_pin, OUTPUT); //define MAX6675 chip select as an output
+  digitalWrite(CS_pin, LOW); //pull chip select low 
+  //-----
+  pinMode(TRIAC_pin, OUTPUT); //Define output pin for switching the TRIAC
+  digitalWrite(TRIAC_pin, LOW); //TRIAC is OFF by default
+  //----
+  pinMode(Fan_pin, OUTPUT); //Define output pin for switching the fan (transistor)
+  digitalWrite(Fan_pin, HIGH); //Enable fan - turn them on as a test to see if they spin up
+
+  //Fill display with black and draw the default curve
+  tft.initR(INITR_BLACKTAB);
+  tft.fillScreen(ST7735_BLACK); //erase screen
+  //Print some welcome message - feel free to change the text and the coordinates
+  tft.setCursor(10, 40); //X, Y
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setRotation(1); //Landscape alignment - SPI pins on right
+  tft.println("Automated reflow staion");
+  tft.setCursor(30, 60); //X, Y
+  tft.println("Curious Scientist"); 
+  tft.setCursor(60, 80); //X, Y
+  tft.println("2022");
+  delay(5000); //keep the above text on the display for 5 seconds 
+
+  //Erase the screen, then draw the starting graph
+  tft.fillScreen(ST7735_BLACK);
+  drawReflowCurve();
+
+  digitalWrite(Fan_pin, LOW); //Disable fan - turn off the "test spin" of the fans
+}
+
+void loop()
+{
+    measureTemperature();
+    CheckRotaryButton();
+    updateHighlighting();
+    drawReflowCurve();
+    heating();    
+}
+
+void RotaryEncoder()
+{
+    CLKNow = digitalRead(RotaryCLK); //Read the state of the CLK pin
+
+    if (preheatTempSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (preheatTemp > 20) 
+                {
+                    preheatTemp--;
+                }
+            }
+            else
+            {
+                if (preheatTemp < 150) //typical max value for preheat phase - feel free to change it
+                {
+                    preheatTemp++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (preheatTimeSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (preheatTime > 0) 
+                {
+                    preheatTime--;
+                }
+            }
+            else
+            {
+                if (preheatTime < 90) //Typical preheat time
+                {
+                    preheatTime++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (soakingTempSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (soakingTemp > 20) 
+                {
+                    soakingTemp--;
+                }              
+            }
+            else
+            {
+                if (soakingTemp < 180) //typical soaking temperature
+                {
+                    soakingTemp++;
+                }                
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (soakingTimeSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (soakingTime > 0) 
+                {
+                    soakingTime--;
+                }
+            }
+            else
+            {
+                if (soakingTime < 180) //typical (total) time at the end of the soaking period
+                {
+                    soakingTime++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (reflowTempSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (reflowTemp > 0) 
+                {
+                    reflowTemp--;
+                }
+            }
+            else
+            {
+                if (reflowTemp < 250) //typical peak temp for reflow 
+                {
+                    reflowTemp++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (reflowTimeSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (reflowTime > 0) 
+                {
+                    reflowTime--;
+                }
+            }
+            else
+            {
+                if (reflowTime < 240)
+                {
+                    reflowTime++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (coolingTempSelected == true)
+    {
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (coolingTemp > 0)
+                {
+                    coolingTemp--;
+                }
+            }
+            else
+            {
+                if (coolingTemp < 250) //holding temperature before enterint the cooling phase
+                {
+                    coolingTemp++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+
+    }
+    else if (coolingTimeSelected == true)
+    {
+        
+        if (CLKNow != CLKPrevious && CLKNow == 1)
+        {
+            if (digitalRead(RotaryDT) != CLKNow)
+            {
+                if (coolingTime > 0) 
+                {
+                    coolingTime--;
+                }       
+            }
+            else
+            {
+                if (coolingTime < 250) //total elapsed seconds before entering the cooling phase
+                {
+                    coolingTime++;
+                }
+            }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }
+    else if (startStopButtonSelected == true)
+    {
+        // start/stop button does not do anything with the encoder
+    }
+    else 
+    {
+        if (CLKNow != CLKPrevious  && CLKNow == 1)
+        {
+          previousItemCounter = itemCounter;
+          if (digitalRead(RotaryDT) != CLKNow)
+          {
+            if (itemCounter > 0) 
+            {
+                itemCounter--;
+            }
+            else
+            {
+                itemCounter = 8; //after the first menu item, we go back to the last menu item         
+            }
+          }
+          else
+          {
+            if (itemCounter < 8)
+            {
+                itemCounter++;
+            }
+            else
+            {
+                itemCounter = 0;  //after the last menu item, we go back to the first menu item
+            }
+        
+         }
+        }
+        menuChanged = true;
+        CLKPrevious = CLKNow;  // Store last CLK state
+    }  
+}
+
+void drawReflowCurve()
+{   
+    if(redrawCurve == true)
+    {
+    tft.fillRect(4,10,156,115,ST77XX_BLACK); //Erase previous content
+    tft.fillScreen(ST7735_BLACK); //Repaint with black - will cause a blink and make the thermometer disappear for 1 s
+    tft.setRotation(1); //Landscape alignment - SPI pins on right
+    //-------------------------------------
+    //Axis pixel offset = 3
+    
+    // Draw chart axes
+    //X-axis line
+    tft.drawLine(3, 125, 157, 125, ST7735_WHITE); //X0, Y0, X1, Y1, Color
+    //Y-axis line
+    tft.drawLine(3, 20, 3, 125, ST7735_RED); //X0, Y0, X1, Y1, Color
+
+    //Calculate the portions of the curve to be plotted
+    //Temperature values converted into pixel values - values are casted into integers (rounding errors can occur: +/-2°C and +/-2s error)
+    preheatTemp_px = (int)((128 - 3) - ( ((double)preheatTemp / tempPixelFactor) - (20.0 / tempPixelFactor)) );
+    preheatTime_px = (int)(3 + ((double)preheatTime / timePixelFactor));
+    //--
+    soakingTemp_px = (int)((128 - 3) - ( ((double)soakingTemp / tempPixelFactor) - (20.0 / tempPixelFactor)) );
+    soakingTime_px = (int)(3 + ((double)soakingTime / timePixelFactor));
+    //--
+    reflowTemp_px = (int)((128 - 3) - ( ((double)reflowTemp / tempPixelFactor) - (20.0 / tempPixelFactor)) );
+    reflowTime_px = (int)(3 + ((double)reflowTime / timePixelFactor));   
+    //--
+    coolingTemp_px = (int)((128 - 3) - (((double)coolingTemp / tempPixelFactor) - (20.0 / tempPixelFactor)));
+    coolingTime_px = (int)(3 + ((double)coolingTime / timePixelFactor)); 
+
+    //Draw reflow curve
+    drawCurve();
+
+    //Draw the values of the portions of the curve
+    //Preheat
+    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 5);
+    tft.setTextColor(ST77XX_RED);
+    tft.print(preheatTemp);
+    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 15);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(preheatTime);
+    //--
+    //Soak
+    tft.setCursor(soakingTime_px - 25, soakingTemp_px - 20);
+    tft.setTextColor(ST77XX_RED);
+    tft.print(soakingTemp);
+    tft.setCursor(soakingTime_px - 25, soakingTemp_px - 10);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(soakingTime);
+    //--
+    //Reflow
+    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 10);
+    tft.setTextColor(ST77XX_RED);
+    tft.print(reflowTemp);
+    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 20);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(reflowTime);
+    //--
+    //Reflow-holding (cooling)
+    tft.setCursor(coolingTime_px, coolingTemp_px - 20);
+    tft.setTextColor(ST77XX_RED);
+    tft.print(coolingTemp);
+    tft.setCursor(coolingTime_px, coolingTemp_px - 10);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(coolingTime);
+
+    //Place the start/stop button
+    tft.fillRect(115, 110, 40, 15, ST7735_RED); //X,Y, W,H, Color
+    tft.setCursor(120, 115);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print("START");
+
+    redrawCurve = false; //disable the redraw (user will trigger a new redraw process)
+    }
+}
+
+void measureTemperature()
+{
+    //Relevant YouTube video for this part: https://www.youtube.com/watch?v=PdS6-TccgK4
+    if (millis() - temperatureTimer > 250) //update frequency = 0.25s - faster than checking the heating (2s)
+    {       
+        //Measure temp via thermocouple
+        //bits
+        //15: dummy bit
+        //14-3: MSB to LSB
+        //2: -
+        //1: 0
+        //0: STATE (three state)  
+
+        SPI.beginTransaction(SPISettings(14000000, MSBFIRST, SPI_MODE0)); //standard Arduino SPI  
+        digitalWrite(CS_pin, LOW); //"Force CS low and apply a clock signal at SCK to read the results at SO"
+        delayMicroseconds(1); //just to be sure we wait enough (tcss: 100 ns is needed)
+
+        TCRaw = SPI.transfer16(0x0000); //16 bit transfer - some dummy data to force the reading
+
+        digitalWrite(CS_pin, HIGH); //We finished the command sequence, so we switch it back to HIGH       
+        SPI.endTransaction(); //close down SPI transaction   
+
+        TCRaw = TCRaw >> 3; //shift out the first 3 bits.
+        //example: 0100000000001ˇ111 >> 3;     ˇLSB
+        //010000000000001<-(LSB)
+        //^Dummy, then MSB
+
+        //Serial.print("Raw: ");
+        //Serial.println(TCRaw); //print raw data on the serial terminal
+
+        TCCelsius = TCRaw * 0.25; //datasheet, 2nd page, resolution
+
+        //Serial.print("Temp: ");
+        //Serial.println(TCCelsius); //print converted data on the serial terminal
+                
+        //--
+        //Update the text on the display whenever a reading is finished
+        tft.fillRect(4, 0, 60, 10, ST7735_WHITE); //erase the previously printed text - longer strip because the target is printed too
+        tft.setCursor(5, 1); //place the cursor to the top left corner of the chart
+        tft.setTextColor(ST77XX_RED); 
+        tft.print("T= ");
+        tft.print(TCCelsius,0); //pass the temperature value (°C) 
+        tft.print(" C");        
+        temperatureTimer = millis(); //reset timer
+    }
+    else
+    {
+        //don't do anything
+    }
+}
+
+void CheckRotaryButton()
+{
+    RotaryButtonValue = digitalRead(RotarySW); //read the button state
+
+    if (RotaryButtonValue == 0) //0 and 1 can differ based on the wiring (NO / NC)
+    {
+        if (millis() - RotaryButtonTime > 1000) //1 sec debounce
+        {
+            switch (itemCounter) //checks the position in the menu
+            {
+            //Preheat temperature
+            case 0:
+                preheatTempSelected = !preheatTempSelected; //flip the status
+                
+                if (preheatTempSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 4, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 5);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(preheatTemp);
+                }
+                else
+                {
+                    redrawCurve = true; //when the status becomes false, we exit the menu, thus we need to redraw the curve
+                    //Actually, this can be done at each encoder click, but I am lazy to implement the code in that way - homework for the diligent viewers
+                    //Yellow background 
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 4, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 5);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(preheatTemp);
+                }
+                break;
+            //Preheat time
+            case 1:
+                preheatTimeSelected = !preheatTimeSelected;
+
+                if (preheatTimeSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 14, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 15);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(preheatTime);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 14, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(preheatTime_px + 3, preheatTemp_px + 15);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(preheatTime);
+                }
+                break;
+                //Soaking temperature
+            case 2:
+                soakingTempSelected = !soakingTempSelected;
+
+                if (soakingTempSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 21, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(soakingTime_px - 25, soakingTemp_px - 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(soakingTemp);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 21, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(soakingTime_px - 25, soakingTemp_px - 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(soakingTemp);
+                }
+                break;
+                //Soaking time
+            case 3:
+                soakingTimeSelected = !soakingTimeSelected;
+
+                if (soakingTimeSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 11, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(soakingTime_px  - 25, soakingTemp_px - 10);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(soakingTime);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 11, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(soakingTime_px - 25, soakingTemp_px - 10);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(soakingTime);
+                }
+                break;
+                //Reflow temperature
+            case 4:
+                reflowTempSelected = !reflowTempSelected;
+
+                if (reflowTempSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 9, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 10);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(reflowTemp);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 9, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 10);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(reflowTemp);
+                }
+                break;
+                //Reflow time
+            case 5:
+                reflowTimeSelected = !reflowTimeSelected;
+
+                if (reflowTimeSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 19, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(reflowTime);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 19, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(reflowTime_px - 5, reflowTemp_px + 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(reflowTime);
+                }
+                break;
+                //Cooling temperature
+            case 6:
+                coolingTempSelected = !coolingTempSelected;
+
+                if (coolingTempSelected == true)
+                {
+                    //Green background  
+                    tft.fillRect(coolingTime_px, coolingTemp_px - 21, 20, 9, ST77XX_GREEN); //highlight
+                    tft.setCursor(coolingTime_px, coolingTemp_px - 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(coolingTemp);
+                }
+                else
+                {
+                    redrawCurve = true;
+                    //Yellow background 
+                    tft.fillRect(coolingTime_px, coolingTemp_px - 21, 20, 9, ST77XX_YELLOW); //highlight
+                    tft.setCursor(coolingTime_px, coolingTemp_px - 20);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print(coolingTemp);
+                }
+                break;
+                //Cooling time
+            case 7:
+            coolingTimeSelected = !coolingTimeSelected;
+
+            if (coolingTimeSelected == true)
+            {
+                //Green background  
+                tft.fillRect(coolingTime_px, coolingTemp_px - 11, 20, 9, ST77XX_GREEN); //highlight
+                tft.setCursor(coolingTime_px, coolingTemp_px - 10);
+                tft.setTextColor(ST77XX_RED);
+                tft.print(coolingTime);
+            }
+            else
+            {
+                redrawCurve = true;
+                //Yellow background 
+                tft.fillRect(coolingTime_px, coolingTemp_px - 11, 20, 9, ST77XX_YELLOW); //highlight
+                tft.setCursor(coolingTime_px, coolingTemp_px - 10);
+                tft.setTextColor(ST77XX_RED);
+                tft.print(coolingTime);
+            }
+            break;
+                //Start // Stop
+            case 8:
+                startStopButtonSelected = !startStopButtonSelected;
+
+                if (startStopButtonSelected == true)
+                {                
+                    //Remove all the numbers, keep only the curve -> It makes the display cleaner, easier to read
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 4, 20, 9, ST77XX_BLACK); //highlight removal
+                    tft.fillRect(preheatTime_px + 3, preheatTemp_px + 14, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 20, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(soakingTime_px - 25, soakingTemp_px - 10, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 10, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(reflowTime_px - 5, reflowTemp_px + 20, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(coolingTime_px, coolingTemp_px - 20, 20, 9, ST77XX_BLACK); 
+                    tft.fillRect(coolingTime_px, coolingTemp_px - 10, 20, 9, ST77XX_BLACK); 
+
+                    drawCurve(); // redraw the curve
+
+                    //Green background 
+                    tft.fillRect(115, 110, 40, 15, ST7735_GREEN); //X,Y, W,H, Color
+                    tft.setCursor(120, 115);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print("STOP");
+                    //---------------------------
+
+                    heatingEnabled = true; //start heating
+                    elapsedHeatingTime = 0; //set the elapsed time to 0
+                }
+                else
+                {                
+                    tft.fillRect(115, 110, 40, 15, ST7735_YELLOW); //X,Y, W,H, Color
+                    tft.setCursor(120, 115);
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print("START");
+                    //---------------------------
+                    //Put back all the values after stop
+                    redrawCurve = true; //simply redraw the whole graph
+                    heatingEnabled = false; //stop heating
+                    coolingFanEnabled = false; //stop cooling fan.
+                    //If user presses stop befor the program is finished, we assume also that the fan is not needed
+                }
+                break;
+            }
+            menuChanged = false;
+            RotaryButtonTime = millis();
+        }
+    }
+}
+
+void updateHighlighting()
+{
+    if (menuChanged == true) //if somewhere in the code we changed the menu, we will be able to enter the part below
+    {
+        switch (itemCounter) //check which menu was changed
+        {
+        case 0:
+            tft.fillRect(preheatTime_px + 3, preheatTemp_px + 4, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(preheatTime_px + 3, preheatTemp_px + 5); //set the cursor to the corresponding spot
+            tft.setTextColor(ST77XX_RED); //set text color
+            tft.print(preheatTemp); //print the value
+            //Note: All the following lines are doing the same, they just print to different coordinates and different values. 
+            break;
+        case 1:
+            tft.fillRect(preheatTime_px + 3, preheatTemp_px + 14, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(preheatTime_px + 3, preheatTemp_px + 15);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(preheatTime);
+            break;
+        case 2:
+            tft.fillRect(soakingTime_px - 25, soakingTemp_px - 21, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(soakingTime_px - 25, soakingTemp_px - 20);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(soakingTemp);
+            break;
+        case 3:
+            tft.fillRect(soakingTime_px - 25, soakingTemp_px - 11, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(soakingTime_px - 25, soakingTemp_px - 10);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(soakingTime);
+            break;
+        case 4:
+            tft.fillRect(reflowTime_px - 5, reflowTemp_px + 9, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(reflowTime_px - 5, reflowTemp_px + 10);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(reflowTemp);
+            break;
+        case 5:
+            tft.fillRect(reflowTime_px  - 5, reflowTemp_px + 19, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(reflowTime_px - 5, reflowTemp_px + 20);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(reflowTime);
+            break;
+        case 6:
+            tft.fillRect(coolingTime_px, coolingTemp_px - 21, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(coolingTime_px, coolingTemp_px - 20);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(coolingTemp);
+            break;
+        case 7:
+            tft.fillRect(coolingTime_px, coolingTemp_px - 11, 20, 9, ST77XX_YELLOW); //highlight
+            tft.setCursor(coolingTime_px, coolingTemp_px - 10);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(coolingTime);
+            break;
+        case 8:
+            tft.fillRect(115, 110, 40, 15, ST7735_YELLOW); //X,Y, W,H, Color
+            tft.setCursor(120, 115);
+            tft.setTextColor(ST77XX_BLACK);
+            tft.print("START");
+            break;
+        }
+
+        //--------------------------------------------------------------------------------------------
+        //Remove the previous highlighting
+        //--------------------------------------------------------------------------------------------
+        switch (previousItemCounter) //check which item was previously highlighted so we can restore its original look (no highlighting)
+        {
+        case 0:
+            tft.fillRect(preheatTime_px + 3, preheatTemp_px + 4, 20, 9, ST77XX_BLACK); //restore original background (black)
+            tft.setCursor(preheatTime_px + 3, preheatTemp_px + 5); //set the cursor to the corresponding place (inside the rectangle)
+            tft.setTextColor(ST77XX_RED); //set text color
+            tft.print(preheatTemp); //print value
+            break;
+        case 1:
+            tft.fillRect(preheatTime_px + 3, preheatTemp_px + 14, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(preheatTime_px + 3, preheatTemp_px + 15);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.print(preheatTime);
+            break;
+        case 2:
+            tft.fillRect(soakingTime_px - 25, soakingTemp_px - 21, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(soakingTime_px - 25, soakingTemp_px - 20);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(soakingTemp);
+            break;
+        case 3:
+            tft.fillRect(soakingTime_px - 25, soakingTemp_px - 11, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(soakingTime_px - 25, soakingTemp_px - 10);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.print(soakingTime);
+            break;
+        case 4:
+            tft.fillRect(reflowTime_px - 5, reflowTemp_px + 9, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(reflowTime_px - 5, reflowTemp_px + 10);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(reflowTemp);
+            break;
+        case 5:
+            tft.fillRect(reflowTime_px - 5, reflowTemp_px + 19, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(reflowTime_px - 5, reflowTemp_px + 20);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.print(reflowTime);
+            break;
+        case 6:
+            tft.fillRect(coolingTime_px, coolingTemp_px - 21, 20, 9, ST77XX_BLACK); 
+            tft.setCursor(coolingTime_px, coolingTemp_px - 20);
+            tft.setTextColor(ST77XX_RED);
+            tft.print(coolingTemp);
+            break;
+        case 7:
+            tft.fillRect(coolingTime_px, coolingTemp_px - 11, 20, 19, ST77XX_BLACK);
+            tft.setCursor(coolingTime_px, coolingTemp_px - 10);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.print(coolingTime);
+            break;
+        case 8:
+            tft.fillRect(115, 110, 40, 15, ST77XX_RED); //X,Y, W,H, Color
+            tft.setCursor(120, 115);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.print("START");
+            break;
+        }
+        menuChanged = false;
+    }
+}
+
+void heating()
+{
+    if (heatingEnabled == true) //If heating was enabled somewhere in the code, we can enter the code below
+    {
+        if (millis() - TRIACTimer > TRIACInterval) //update frequency = 1s - should be less frequent than the temperature readings
+        {
+            //Draw a pixel for the temperature measurement
+            measuredTemp_px = (int)((128 - 3) - ((TCCelsius / tempPixelFactor) - (20.0 / tempPixelFactor)));
+            measuredTime_px = (int)(3 + (elapsedHeatingTime / timePixelFactor));
+            
+            //Also print the elapsed time in second
+            tft.fillRect(4, 10, 60, 10, ST7735_WHITE); //erase the previously printed text
+            tft.setCursor(5, 11); //place the cursor to the top left corner of the chart
+            tft.setTextColor(ST77XX_RED);
+            tft.print("t= ");
+            tft.print(elapsedHeatingTime, 0); //pass the time in seconds
+            tft.print(" s");
+
+            //Send time and temperature to the serial port with a space (" ") separator, so it can be easily plotted
+            /*
+                Serial.print(elapsedHeatingTime);
+                Serial.print("  ");
+                Serial.println(TCCelsius);
+                Serial.println(" ");
+                //Send pixel values too            
+                Serial.print(measuredTime_px);
+                Serial.print("  ");
+                Serial.println(measuredTemp_px);
+            */
+
+            //Draw the pixel (time vs. temperature) on the chart
+            tft.drawPixel(measuredTime_px, measuredTemp_px, ST77XX_CYAN);
+            tft.drawPixel(measuredTime_px, measuredTemp_px + 1, ST77XX_CYAN); //putting another pixel next (on Y) the original, "fake thick line"     
+
+            switch (programCounter) //This part determines the code's progress along the reflow curve
+            {
+                case 0: //preheat
+                    targetTemp = 20 + (elapsedHeatingTime * (1.0/preheatTime) * (preheatTemp-20) ); //20! - this is important because it is also the zero of the axis
+                    //Example: 20 + (0 * (1/90) * (90-20)) = 20 + 0 = 20
+                    // 2s later: 20 + (2 * (1/90) * (90-20)) = 20 + 1.56 = 21.6
+                    // 10s later: 20 + (10 * (1/90) * (90-20)) = 20 + 7.78 = 27.8
+                    //...
+
+                    //Print the target
+                    tft.fillRect(64, 0, 70, 10, ST7735_WHITE); //erase the previously printed text
+                    tft.setCursor(66, 1); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_RED);
+                    tft.print("T'= ");
+                    tft.print(targetTemp, 0); //pass the time in seconds
+                    tft.print(" C");
+
+                    /*
+                    Serial.print("Preheat target: ");
+                    Serial.print(targetTemp);
+                    Serial.println(" C");      
+                    */
+
+                    //If we are below the target temperature according to the T(t) relationship, we turn on the heating
+                    if (TCCelsius < targetTemp)
+                    {
+                        digitalWrite(TRIAC_pin, HIGH);
+
+                        //Print the actual phase on the display
+                        tft.fillRect(64, 10, 70, 10, ST7735_GREEN); //erase the previously printed text
+                        tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                        tft.setTextColor(ST77XX_BLACK);
+                        tft.print("Preheat");
+                        //Serial.println("Preheat ON");
+                    }
+                    else //otherwise, we overshot the temperature, so the heating must be off
+                    {
+                        digitalWrite(TRIAC_pin, LOW);
+                        //Print the actual phase on the display
+                        tft.fillRect(64, 10, 70, 10, ST7735_RED); //erase the previously printed text
+                        tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                        tft.setTextColor(ST77XX_BLACK);
+                        tft.print("Preheat");
+                        //Serial.println("Preheat OFF");
+                    }
+
+                    if (TCCelsius > preheatTemp && elapsedHeatingTime > preheatTime) //check if we have reached the program target
+                    {
+                        programCounter = 1; //advance to the next program step -> soaking
+                    }
+                    //Note: The following parts follow the same strategy. We calculate the expected temperature at the moment and based on the result
+                    //we either turn the heater on (or keep it on), or turn the heater off (or keep it off). This is a very primitive control and it is
+                    //not the most precise strategy, but at this moment, I go with this simple approach.
+                    break;
+
+            case 1: //soak
+
+                targetTemp = preheatTemp + ((elapsedHeatingTime-preheatTime) * (1.0 / (soakingTime-preheatTime)) * (soakingTemp - preheatTemp));
+                //Example: 90 + ((90-90) * (1/(180-90)) * (130-90) = 90
+                // 2s later: 90 +((92-90) * (1/90) * (40)) = 90 + 0.89 = 90.9
+                // 10s later: 90 +((100-90) * (1/90) * (40)) = 90 + 4.44 = 94.4
+                //. . .
+                
+                //Print the target
+                tft.fillRect(64, 0, 70, 10, ST7735_WHITE); //erase the previously printed text
+                tft.setCursor(66, 1); //place the cursor to the top left corner of the chart
+                tft.setTextColor(ST77XX_RED);
+                tft.print("T'= ");
+                tft.print(targetTemp, 0); //pass the time in seconds
+                tft.print(" C");
+
+                /*
+                Serial.print("Soak target: ");
+                Serial.print(targetTemp);
+                Serial.println(" C");
+                */                
+
+                if (TCCelsius < targetTemp)
+                {
+                    digitalWrite(TRIAC_pin, HIGH); 
+                    tft.fillRect(64, 10, 70, 10, ST7735_GREEN); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Soaking");
+                    //Serial.println("Soak ON");
+                }
+                else
+                {
+                    digitalWrite(TRIAC_pin, LOW);
+                    tft.fillRect(64, 10, 70, 10, ST7735_RED); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Soaking");
+                    //Serial.println("Soak OFF");
+                }
+
+                if (TCCelsius > soakingTemp && elapsedHeatingTime > soakingTime) //check if we have reached the program target
+                {
+                    programCounter = 2; //advance to the next program step -> reflowing
+                }
+                break;
+
+            case 2: //reflow
+
+                targetTemp = soakingTemp + ((elapsedHeatingTime - soakingTime) * (1.0 / (reflowTime-soakingTime)) * (reflowTemp - soakingTemp));
+                //Example: 130 + ((180-180) * (1/(240-180)) * (165-130)) = 130
+                //2s later: 130 + ((182-180) * (1/60) * (35)) = 130 + 1.17 = 131.2
+                // 10s later: 130 + ((190-180) * (1/60) * (35)) = 130 + 5.83 = 135.8
+                
+                //Print the target
+                tft.fillRect(64, 0, 70, 10, ST7735_WHITE); //erase the previously printed text
+                tft.setCursor(66, 1); //place the cursor to the top left corner of the chart
+                tft.setTextColor(ST77XX_RED);
+                tft.print("T'= ");
+                tft.print(targetTemp, 0); //pass the time in seconds
+                tft.print(" C");
+
+                /*
+                Serial.print("Reflow target: ");
+                Serial.print(targetTemp);
+                Serial.println(" C");
+                */
+
+                if (TCCelsius < targetTemp)
+                {
+                    digitalWrite(TRIAC_pin, HIGH); 
+                    tft.fillRect(64, 10, 70, 10, ST7735_GREEN); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Reflow");
+                    //Serial.println("Reflow ON");
+                }
+                else
+                {
+                    digitalWrite(TRIAC_pin, LOW); 
+                    tft.fillRect(64, 10, 70, 10, ST7735_RED); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Reflow");
+                    //Serial.println("Reflow OFF");
+                }
+
+                if (TCCelsius > reflowTemp && elapsedHeatingTime > reflowTime) //check if we have reached the program target
+                {
+                    programCounter = 3; //advance to the next program step -> Holding
+                }
+                break;
+
+            case 3: //hold a little (~10 s) at reflow (peak) temp 
+
+                targetTemp = reflowTemp + ((elapsedHeatingTime - reflowTime) * (1.0 / (coolingTime-reflowTime)) * (coolingTemp - reflowTemp));
+                //Example: 165 + ((240-240) * (1/(250-240)) * (165-165)) = 165
+                //2s later: 165 + ((242-240) * (1/10) * (0) = 165 + 2 = 165
+                //10s later: 165 + ((250-240) * (1/10) * (0) = 165 + 10 = 165                
+
+                //Print the target
+                tft.fillRect(64, 0, 70, 10, ST7735_WHITE); //erase the previously printed text
+                tft.setCursor(66, 1); //place the cursor to the top left corner of the chart
+                tft.setTextColor(ST77XX_RED);
+                tft.print("T'= ");
+                tft.print(targetTemp, 0); //pass the time in seconds
+                tft.print(" C");
+
+                /*
+                Serial.print("Reflow-holding target: ");
+                Serial.print(targetTemp);
+                Serial.println(" C");
+                */
+
+                if (TCCelsius < targetTemp)
+                {
+                    digitalWrite(TRIAC_pin, HIGH);
+                    tft.fillRect(64, 10, 70, 10, ST7735_GREEN); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Holding");
+                    //Serial.println("Reflow-holding ON");
+                }
+                else
+                {
+                    digitalWrite(TRIAC_pin, LOW); 
+                    tft.fillRect(64, 10, 70, 10, ST7735_RED); //erase the previously printed text
+                    tft.setCursor(65, 11); //place the cursor to the top left corner of the chart
+                    tft.setTextColor(ST77XX_BLACK);
+                    tft.print("Holding");
+                    //Serial.println("Reflow-holding OFF");
+                }
+
+                if (TCCelsius > coolingTemp && elapsedHeatingTime > coolingTime) //check if we have reached the program target
+                {
+                    programCounter = 4; //advance to the next program step -> Cooling
+                }
+                break;
+
+            case 4: //cooling
+
+                //Serial.print("Cooling started.");
+
+                tft.fillRect(64, 0, 70, 10, ST77XX_BLUE); //erase the target temperature
+                tft.fillRect(64, 10, 70, 10, ST77XX_BLUE); //erase the previously printed text
+                tft.setCursor(70, 6); //place the cursor to the top left corner of the chart
+                tft.setTextColor(ST77XX_WHITE);
+                tft.print("Cooling");
+
+                //Turn off heating
+                heatingEnabled = false; //disable heating
+                digitalWrite(TRIAC_pin, LOW); //turn off the TRIAC - heating is OFF
+                //-----------------------------------------------------------------
+                //Turn on cooling
+                coolingFanEnabled = true; //enable cooling
+                digitalWrite(Fan_pin, HIGH); //turn on the fan
+                fanTimer = millis(); //start fan timer from this period
+                break;
+
+            }
+
+            elapsedHeatingTime += (TRIACInterval/1000.0); //TRIACInterval is in ms, so it has to be divided by 1000
+            
+            /*
+            Serial.print("Elapsed heating time: ");
+            Serial.println(elapsedHeatingTime);
+            */
+
+            TRIACTimer = millis();
+        }
+          
+    }
+    else //heating is NOT enabled (disabled)
+    {     
+        if (millis() - TRIACTimer > TRIACInterval) //update frequency = 1s - should be less frequent than the temperature readings
+        {
+            //if heating is disabled but the fan was started and it hasn't been running for 60000 ms = 60 s = 1 min
+            if (coolingFanEnabled == true && millis() - fanTimer > 60000) 
+            {
+                digitalWrite(Fan_pin, LOW); //turn off the fan after 1 min
+                coolingFanEnabled = false;
+                //Upon exiting, redraw the whole display and default everything
+                tft.fillRect(115, 110, 40, 15, ST7735_YELLOW); //X,Y, W,H, Color
+                tft.setCursor(120, 115);
+                tft.setTextColor(ST77XX_RED);
+                tft.print("START");
+                //---------------------------
+                //Put back all the values after stop
+                redrawCurve = true; //simply redraw the whole graph
+                heatingEnabled = false; //stop heating
+            }
+
+            if (coolingFanEnabled == true) //If heating is disabled, but the cooling is enabled, keep drawing the chart
+            {
+                elapsedHeatingTime += (TRIACInterval / 1000.0); //keep interval ticking
+
+                //Keep drawing the realtime temperature curve while the cooling is ongoing
+                measuredTemp_px = (int)((128 - 3) - ((TCCelsius / tempPixelFactor) - (20.0 / tempPixelFactor)));
+                measuredTime_px = (int)(3 + (elapsedHeatingTime / timePixelFactor));
+
+                //Keep printing the elapsed time and keep plotting the cooling portion of the curve
+                tft.fillRect(4, 10, 60, 10, ST7735_WHITE); //erase the previously printed text
+                tft.setCursor(5, 11); //place the cursor to the top left corner of the chart
+                tft.setTextColor(ST77XX_RED);
+                tft.print("t= ");
+                tft.print(elapsedHeatingTime, 0); 
+                tft.print(" s");
+                tft.drawPixel(measuredTime_px, measuredTemp_px, ST77XX_CYAN);
+                tft.drawPixel(measuredTime_px, measuredTemp_px + 1, ST77XX_CYAN); //putting another pixel next (on Y) the original, fake thick line      
+            }
+
+            TRIACTimer = millis();
+        }
+    
+    }
+}
+
+void drawCurve()
+{
+    //This function draws the user-made reflow curve. 
+    //Since the axes are slightly shifted from the edge of the display, there is a 3px shift for the start of the preheat curve
+    //I indicated different sections of the reflow curve by different colors.
+    //The cooling time +20 is just an arbitrary value, just to illustrate the cooling part (decreasing temperature) on the reflow curve. 
+    //It has no physical meaning other than it illustrates the cooling.
+
+    //Horizontal lines (ticks) at every 50C
+    tft.drawLine(4, 111, 10, 111, ST77XX_RED); //50C
+    tft.drawLine(4, 88, 10, 88, ST77XX_RED); //100C
+    tft.drawLine(4, 65, 10, 65, ST77XX_RED); //150C
+    tft.drawLine(4, 42, 10, 42, ST77XX_RED); //200C
+
+    //Vertical lines (ticks) at every 30s
+    tft.drawLine(18, 124, 18, 118, ST77XX_WHITE); //30S
+    tft.drawLine(34, 124, 34, 118, ST77XX_WHITE); //60S
+    tft.drawLine(49, 124, 49, 118, ST77XX_WHITE); //90S
+    tft.drawLine(65, 124, 65, 118, ST77XX_WHITE); //120S
+    tft.drawLine(80, 124, 80, 118, ST77XX_WHITE); //150S
+    tft.drawLine(95, 124, 95, 118, ST77XX_WHITE); //180S
+    tft.drawLine(110, 124, 110, 118, ST77XX_WHITE); //210S
+    tft.drawLine(126, 124, 126, 118, ST77XX_WHITE); //240S
+    tft.drawLine(141, 124, 141, 118, ST77XX_WHITE); //270S
+
+    tft.drawLine(0 + 3, 128 - 3, preheatTime_px, preheatTemp_px, ST77XX_YELLOW);
+    tft.drawLine(preheatTime_px, preheatTemp_px, soakingTime_px, soakingTemp_px, ST77XX_ORANGE);
+    tft.drawLine(soakingTime_px, soakingTemp_px, reflowTime_px, reflowTemp_px, ST77XX_RED);
+    tft.drawLine(reflowTime_px, reflowTemp_px, coolingTime_px, coolingTemp_px, ST77XX_RED);
+    tft.drawLine(coolingTime_px, coolingTemp_px, coolingTime_px + 20, coolingTemp_px + 20, ST77XX_BLUE);
+}
